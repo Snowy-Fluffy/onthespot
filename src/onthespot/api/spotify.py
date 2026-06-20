@@ -29,6 +29,8 @@ BASE_URL = "https://api.spotify.com/v1"
 _oauth_token_cache = {"access_token": None, "expires_at": 0, "client_id": None}
 _oauth_token_lock = threading.Lock()
 
+_session_reinit_lock = threading.Lock()
+
 
 def spotify_get_oauth_token():
     """Return an OAuth access token via the Client-Credentials flow using the
@@ -371,30 +373,42 @@ def spotify_login_user(account):
         return False
 
 
-def spotify_re_init_session(account):
+def spotify_re_init_session(account, dead_session=None):
     session_json_path = os.path.join(
         cache_dir(), "sessions", f"ots_login_{account['uuid']}.json"
     )
-    try:
-        config = (
-            Session.Configuration.Builder()
-            .set_stored_credential_file(session_json_path)
-            .build()
-        )
-        logger.debug("Session config created")
-        session = Session.Builder(conf=config).stored_file(session_json_path).create()
-        logger.debug("Session re init done")
-        account["login"]["session_path"] = session_json_path
-        account["login"]["session"] = session
-        account["status"] = "active"
-        account["account_type"] = session.get_user_attribute("type")
-        bitrate = "160k"
-        account_type = session.get_user_attribute("type")
-        if account_type == "premium":
-            bitrate = "320k"
-        account["bitrate"] = bitrate
-    except:
-        logger.error("Failed to re init session !")
+    with _session_reinit_lock:
+        old_session = account.get("login", {}).get("session")
+        if dead_session is not None and old_session is not dead_session:
+            return
+        if old_session:
+            try:
+                old_session.close()
+            except Exception as e:
+                logger.debug(f"Failed to close old session: {e}")
+            account["login"]["session"] = ""
+        try:
+            config = (
+                Session.Configuration.Builder()
+                .set_stored_credential_file(session_json_path)
+                .build()
+            )
+            logger.debug("Session config created")
+            session = (
+                Session.Builder(conf=config).stored_file(session_json_path).create()
+            )
+            logger.debug("Session re init done")
+            account["login"]["session_path"] = session_json_path
+            account["login"]["session"] = session
+            account["status"] = "active"
+            account["account_type"] = session.get_user_attribute("type")
+            bitrate = "160k"
+            account_type = session.get_user_attribute("type")
+            if account_type == "premium":
+                bitrate = "320k"
+            account["bitrate"] = bitrate
+        except Exception:
+            logger.error("Failed to re init session !")
 
 
 def spotify_get_token(parsing_index):
@@ -799,47 +813,6 @@ def spotify_get_track_metadata(token, item_id):
     track_data = {"tracks": [track]}
     time.sleep(delay)
 
-    # The album and artist lookups only enrich the metadata (label, copyright,
-    # total discs, genre). If they fail - None on a permanent error, or a raise
-    # on exhausted retries - fall back to the data embedded in the track response
-    # so the track is still downloadable.
-    try:
-        album_data = (
-            make_call(
-                f"{BASE_URL}/albums/{track_data.get('tracks', [])[0].get('album', {}).get('id')}",
-                headers=headers,
-            )
-            or {}
-        )
-    except Exception:
-        album_data = {}
-    time.sleep(delay)
-    try:
-        artist_data = (
-            make_call(
-                f"{BASE_URL}/artists/{track_data.get('tracks', [])[0].get('artists', [])[0].get('id')}",
-                headers=headers,
-            )
-            or {}
-        )
-    except Exception:
-        artist_data = {}
-    time.sleep(delay)
-    try:
-        track_audio_data = make_call(
-            f"{BASE_URL}/audio-features/{item_id}", headers=headers
-        )
-        time.sleep(delay)
-    except Exception:
-        track_audio_data = ""
-    try:
-        credits_data = make_call(
-            f"https://spclient.wg.spotify.com/track-credits-view/v0/experimental/{item_id}/credits",
-            headers=librespot_headers,
-        )
-    except Exception:
-        credits_data = ""
-
     # Calculate number of API calls required
     api_total_calls = 1
     if config.get("fetch_extended_album_metadata", True):
@@ -850,56 +823,66 @@ def spotify_get_track_metadata(token, item_id):
     logger.info(
         f"[API Call {call_num}/{api_total_calls}] Fetching track data for track_id={item_id}"
     )
-    track_data = make_call(f"{BASE_URL}/tracks?ids={item_id}", headers=headers)
+    # The album and artist lookups only enrich the metadata (label, copyright,
+    # total discs, genre). If they fail - None on a permanent error, or a raise
+    # on exhausted retries - fall back to the data embedded in the track response
+    # so the track is still downloadable.
+    if config.get("fetch_extended_album_metadata", True):
+        try:
+            album_data = (
+                make_call(
+                    f"{BASE_URL}/albums/{track_data.get('tracks', [])[0].get('album', {}).get('id')}",
+                    headers=headers,
+                )
+                or {}
+            )
+        except Exception:
+            album_data = {}
+    else:
+        album_data = {}
+    time.sleep(delay)
+    if config.get("fetch_genre_metadata", True):
+        try:
+            artist_data = (
+                make_call(
+                    f"{BASE_URL}/artists/{track_data.get('tracks', [])[0].get('artists', [])[0].get('id')}",
+                    headers=headers,
+                )
+                or {}
+            )
+        except Exception:
+            artist_data = {}
+    else:
+        artist_data = {}
+    time.sleep(delay)
+    if config.get("fetch_audio_features", True):
+        try:
+            track_audio_data = make_call(
+                f"{BASE_URL}/audio-features/{item_id}", headers=headers
+            )
+            time.sleep(delay)
+        except Exception:
+            track_audio_data = ""
+    else:
+        track_audio_data = ""
+    if config.get("fetch_track_credits", True):
+        try:
+            credits_data = make_call(
+                f"https://spclient.wg.spotify.com/track-credits-view/v0/experimental/{item_id}/credits",
+                headers=librespot_headers,
+            )
+        except Exception:
+            credits_data = ""
+    else:
+        credits_data = ""
+
     time.sleep(config.get("api_request_delay", 0.1))
     call_num += 1
 
     # Use embedded album data (album_type, name, images, total_tracks already available)
+
     album_data = track_data.get("tracks", [])[0].get("album", {})
 
-    # Only fetch full album if we need label/copyright (optional fields)
-    if config.get("fetch_extended_album_metadata", True):
-        album_id = track_data.get("tracks", [])[0].get("album", {}).get("id")
-        logger.info(
-            f"[API Call {call_num}/{api_total_calls}] Fetching extended album metadata for album_id={album_id}"
-        )
-        full_album = make_call(f"{BASE_URL}/albums/{album_id}", headers=headers)
-        time.sleep(config.get("api_request_delay", 0.1))
-        call_num += 1
-        album_data = full_album  # Use full data if fetched
-
-    # Fetch artist data only if genre metadata is enabled
-    artist_data = {}
-    if config.get("fetch_genre_metadata", True):
-        artist_id = track_data.get("tracks", [])[0].get("artists", [])[0].get("id")
-        logger.info(
-            f"[API Call {call_num}/{api_total_calls}] Fetching artist data for artist_id={artist_id}"
-        )
-        artist_data = make_call(f"{BASE_URL}/artists/{artist_id}", headers=headers)
-        time.sleep(config.get("api_request_delay", 0.1))
-        call_num += 1
-
-    # Fetch audio features only if enabled
-    track_audio_data = ""
-    """
-    if config.get('fetch_audio_features', True):
-        try:
-            logger.info(f"[API Call 5/6] Fetching audio features for track_id={item_id}")
-            track_audio_data = make_call(f'{BASE_URL}/audio-features/{item_id}', headers=headers)
-            time.sleep(config.get('api_request_delay', 0.1))
-        except Exception:
-            track_audio_data = ''
-    """
-    # Fetch credits only if enabled
-    credits_data = ""
-    """
-    if config.get('fetch_track_credits', True):
-        try:
-            logger.info(f"[API Call 6/6] Fetching track credits for track_id={item_id}")
-            credits_data = make_call(f'https://spclient.wg.spotify.com/track-credits-view/v0/experimental/{item_id}/credits', headers=headers)
-        except Exception:
-            credits_data = ''
-    """
     # Artists
     artists = []
     for data in track_data.get("tracks", [{}])[0].get("artists", []):
@@ -1107,3 +1090,4 @@ def spotify_get_podcast_episode_ids(token, show_id):
         if episode:
             item_ids.append(episode["id"])
     return item_ids
+
